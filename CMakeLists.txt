@@ -456,6 +456,22 @@ add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
+
+# ---- fork-local: extra CUDA architectures for the vision sidecar only ----
+# Absent: basalt-vision is built with the engine's architecture, as always (Blackwell only).
+# Present (e.g. -DBASALT_VISION_ARCHITECTURES=86 for an RTX 3060): the sidecar is built fat for
+# the engine architecture AND the named ones; the engine itself stays Blackwell-only.
+set(BASALT_VISION_ARCHITECTURES "" CACHE STRING "Extra CUDA architectures for bin/basalt-vision, e.g. 86")
+if(BASALT_VISION_ARCHITECTURES)
+  foreach(_vision_target vision_core vision_cuda basalt-vision vision_cpu_parity vision_cuda_parity)
+    if(TARGET ${_vision_target})
+      set_target_properties(${_vision_target} PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES};${BASALT_VISION_ARCHITECTURES}")
+    endif()
+  endforeach()
+  message(STATUS "basalt: vision sidecar CUDA archs: ${CMAKE_CUDA_ARCHITECTURES};${BASALT_VISION_ARCHITECTURES}")
+endif()
+# ---- end fork-local vision arch ----
+
 target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)

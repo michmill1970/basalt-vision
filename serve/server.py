@@ -12,6 +12,7 @@ context are rejected with a 400, never truncated.
 from __future__ import annotations
 
 import json
+import os                                        # fork-local: BASALT_VISION_ANY_CARD
 import signal
 import sys
 import threading
@@ -116,7 +117,12 @@ def main() -> int:
                 try:
                     gpu_plan(a.engine_bin, str(card))
                 except ValueError as e:
-                    fail(f"vision: {e}")
+                    # fork-local: BASALT_VISION_ANY_CARD lets the sidecar take a card outside the engine's
+                    # Blackwell tier (a fat basalt-vision, BASALT_VISION_ARCHITECTURES, runs the same kernels there)
+                    if os.environ.get("BASALT_VISION_ANY_CARD"):
+                        print(f"[server] warning: vision: {e}", flush=True)
+                    else:
+                        fail(f"vision: {e}")
             for note in plan.get("notes") or []:
                 print(f"[server] {note}", flush=True)
             if plan.get("warning"):

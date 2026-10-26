@@ -1016,6 +1016,54 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     return bw;
 }
 
+// Host->device bandwidth with every card in `devs` copying at once from its own pinned buffer, in GB/s (the best of
+// two rounds); -1 when a buffer or a copy fails.  Cards that share a switch, a root port or the RAM read below the sum
+// of their own links.
+double probe_h2d_together_gbps(const std::vector<int>& devs) {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kBursts = 4;
+    struct Card { int dev; void* h = nullptr; void* d = nullptr; cudaStream_t s = nullptr; };
+    std::vector<Card> cards;
+    bool ok = !devs.empty();
+    for (int dev : devs) {
+        if (!ok) break;
+        const basalt::core::OnDevice on(dev);
+        Card c{dev};
+        ok = cudaHostAlloc(&c.h, kBytes, cudaHostAllocPortable) == cudaSuccess && cudaMalloc(&c.d, kBytes) == cudaSuccess &&
+             cudaStreamCreateWithFlags(&c.s, cudaStreamNonBlocking) == cudaSuccess;
+        if (c.h != nullptr) std::memset(c.h, 0, kBytes);   // fault the pages in before timing
+        ok = ok && cudaMemcpyAsync(c.d, c.h, kBytes, cudaMemcpyHostToDevice, c.s) == cudaSuccess &&   // warmup
+             cudaStreamSynchronize(c.s) == cudaSuccess;
+        cards.push_back(c);
+    }
+    double bw = -1.0;
+    for (int round = 0; ok && round < 2; ++round) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int b = 0; ok && b < kBursts; ++b)
+            for (const Card& c : cards) {
+                const basalt::core::OnDevice on(c.dev);
+                ok = ok && cudaMemcpyAsync(c.d, c.h, kBytes, cudaMemcpyHostToDevice, c.s) == cudaSuccess;
+            }
+        for (const Card& c : cards) {
+            const basalt::core::OnDevice on(c.dev);
+            ok = cudaStreamSynchronize(c.s) == cudaSuccess && ok;
+        }
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (ok && sec > 0) bw = std::max(bw, (double) kBytes * kBursts * (double) cards.size() / sec / 1e9);
+    }
+    for (const Card& c : cards) {
+        const basalt::core::OnDevice on(c.dev);
+        if (c.s != nullptr) cudaStreamDestroy(c.s);
+        if (c.d != nullptr) cudaFree(c.d);
+        if (c.h != nullptr) cudaFreeHost(c.h);
+    }
+    if (!ok) {
+        (void) cudaGetLastError();
+        return -1.0;
+    }
+    return bw;
+}
+
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share for a x16 link) from 20 GB/s
 // up, and below that in proportion to the bandwidth, so the time the link spends on its share stays about what the
 // x16 share costs.  Continuous, so a reading near either edge does not move the share by a large part of its range.
@@ -1403,10 +1451,13 @@ int main(int argc, char** argv) {
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
     const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
-    // card's included: on three or more cards none until measured there (--exp prompt_split=N: up to N stages).  With
-    // --batch a read splits only while no slot decodes.
+    // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
+    // until measured on such a set.  With --batch a read splits only while no slot decodes.
     bool split_want = o.serve && o.peer_device >= 1;
-    const int split_cap = o.peer_devices.size() <= 1 ? 2 : (int) basalt::core::exp_flag("prompt_split", 1.0);
+    bool split_alike = true;
+    for (size_t i = 1; i < chosen_cards.size(); ++i)
+        split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
+    const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
@@ -4726,6 +4777,7 @@ int main(int argc, char** argv) {
     // ---- the prompt-time split: what this engine can run it with, and each tier card's link (probed while the cards are
     // empty).  The stages, in the order their cards join a split (prompt_split_order).
     std::vector<std::unique_ptr<PromptStage>> pstages;
+    double split_host_gbps = 0;   // the host's bandwidth to the main card and every tier card at once
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
                         : !src.complement_ready() ? "no RAM copy of the experts"
@@ -4748,6 +4800,15 @@ int main(int argc, char** argv) {
             }
         }
         if (off == nullptr && main_link_gbps <= 0) off = "a link probe failed";
+        if (off == nullptr) {
+            std::vector<int> devs = {0};
+            for (const auto& st : pstages) devs.push_back(st->dev);
+            split_host_gbps = probe_h2d_together_gbps(devs);
+            if (split_host_gbps <= 0) off = "a link probe failed";
+            else
+                basalt::log::info("basalt generate", "prompt split: %.1f GB/s host->device with %zu cards copying at once",
+                                  split_host_gbps, devs.size());
+        }
         if (off != nullptr) {
             basalt::log::info("basalt generate", "prompt split: off (%s)", off);
             split_want = false;
@@ -4816,6 +4877,7 @@ int main(int argc, char** argv) {
         part.row_bytes = (uint64_t) (g.hc * g.n_embd) * sizeof(float);
         const int64_t c_last = b0 - part.split_chunks.back();
         part.draft_rows = draft_window > 0 ? std::max<int64_t>(0, c_last - std::max(a0, prompt_end - draft_window)) : 0;
+        part.host_gbps = split_host_gbps;
         std::vector<basalt::program::PsCard> peers;
         for (const auto& st : pstages) {
             const uint64_t region = st->image_bytes + basalt::core::prompt_session_bytes(g, b0 + 64, st->lo, st->hi) +
@@ -4881,11 +4943,11 @@ int main(int argc, char** argv) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token context is too short for it)",
                               (long long) o.max_context);
         } else if (split_cap < 2) {
-            basalt::log::info("basalt generate", "prompt split: off on %zu cards until measured there (a %lld-token prompt: "
-                                 "%.0f ms on CUDA0, %.0f ms with %s%s; --exp prompt_split=%d reads across them)",
+            basalt::log::info("basalt generate", "prompt split: off on %zu unlike cards until measured there (a %lld-token "
+                                 "prompt: %.0f ms on CUDA0, %.0f ms with %s%s)",
                               pstages.size() + 1, (long long) longest, ref_all.price.tier_ms, ref_all.price.split_ms,
                               split_layers_text(ref_all.price.stages, ref_all.price.cuts).c_str(),
-                              split_stages_text(ref_all.price).c_str(), all);
+                              split_stages_text(ref_all.price).c_str());
         } else if (!ref.price.split) {
             basalt::log::info("basalt generate", "prompt split: off (a %lld-token prompt: %.0f ms on CUDA0, %.0f ms across%s)",
                               (long long) longest, ref.price.tier_ms, ref.price.split_ms, split_stages_text(ref.price).c_str());
@@ -5355,10 +5417,17 @@ int main(int argc, char** argv) {
             // a stage that may hand its chunks on (every card but the one that reads the last layers) holds two pinned
             // buffers of the stage's chunk, as the main card does
             ok = ok && (j == 0 || st.sp.reserve_hand_off(split_chunk_max, err));
+            // a read's kernels and small buffers load on the card outside the lent slots: a card without room for them
+            // beside its stage declines here, before a read could fail on them
+            constexpr size_t kStageFreeMin = 256ull << 20;
+            size_t fb = 0, tb = 0;
+            if (ok && cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb < kStageFreeMin) {
+                ok = false;
+                err = std::to_string(fb >> 20) + " MiB free beside its stage, a read needs " +
+                      std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";
+            }
             if (ok) {
                 st.sp.set_ring_remote(host_res.data(), &xcache, 0);
-                size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
                 basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
                                      "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", st.dev,
                                   (long long) st.lo, (long long) st.hi - 1, (long long) split_chunk_max,

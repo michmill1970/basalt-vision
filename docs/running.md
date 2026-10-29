@@ -153,6 +153,45 @@ once a second:
 `/metrics` carries the history behind the charts in `history` (`tok_s`, `prefill_tok_s_mean`, `slot_tok_s` one series
 per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest requests in `best`.
 
+## Conversations on disk: `--conversation-cache-disk-mib`
+
+`--conversation-cache-disk-mib N` (an engine flag, also `"conversation-cache-disk-mib"` in the config's `engine`
+section) parks conversations on disk under the RAM cache, in at most N MiB. The disk tier is off unless N is above 0
+(the default is 0). It writes to the folder `conversations` inside the model's cache folder (`~/.cache/basalt/<hash>/`,
+where the engine log is); `--conversation-cache-dir DIR` only names another folder, and does nothing on its own.
+When the tier is on the server prints `[disk] conversations=DIR disk-mib=N` at start. A conversation of at least 8192 tokens that leaves its session (another one takes its slot), that the RAM cache
+evicts, or that the engine still holds when it ends (a stop, an idle unload) is written to DIR: one file for its
+tokens and running state, and shared files for its K/V cache (one per 4096 cells) and for each checkpoint's state,
+each named by the tokens it covers and its bytes, so the same conversation written again, or another that starts the
+same way, writes only the blocks and states that are new. A conversation whose last checkpoint (the end of its last
+prompt) is at most 4096 tokens behind is stored as of that checkpoint, with no running state of its own: the next
+turn goes on from there, and a reply sent back as it was is read again. A later prompt that starts with a stored conversation (its
+tokens, or one of its checkpoints) reads it back cut at that point and goes on from there, after a restart too: the
+wait is the drive reading the K/V cache instead of the prompt being read again. The writes run on a background thread
+with direct I/O; a request that parks a conversation waits only for the copy out of the GPU. A file is bound to the
+model file, the stored-conversation format and the settings that change the state (the KV type, the rope, the draft layer, control
+vectors); every part of it carries a hash, and a file that does not check out is deleted, never restored. A
+conversation is written again only once it has grown 4096 tokens past its stored copy, and after a second without
+input (no slot decoding) the engine writes each one that has, so a crash or a kill loses at most that much of a
+conversation. The budget caps the folder, least recently used conversations first (a
+shared file goes with the last conversation that uses it), and a write always leaves 4 GiB of the volume free. Writes
+on the drive that holds the model file can slow its next load: a cache directory on another drive avoids that.
+
+## Sleep: `--idle-sleep`
+
+`--idle-sleep SECONDS` (a server option, also `"idle-sleep"` in the config's `server` section) puts the model to sleep
+after that long without requests. The engine first gives its expert caches' VRAM back, a peer card's tier included
+(each expert has its RAM copy and the slot it held is remembered; an exclusive peer tier stays), and drops the RAM
+copy's registration with the driver, then the driver moves the rest of its GPU state (weights, KV cache, buffers) to
+host memory and releases the VRAM. The process, its RAM copy of the experts, the conversations it holds and the
+placement the adaptive tier learned all stay. The next request wakes it: the driver puts the GPU state back at the same
+addresses, the engine registers the RAM copy again and the caches refill from the parts already registered, so the
+request runs as it would have before the sleep (when the VRAM left after the restore holds the last few
+slots too). The server
+checks first that the GPU state fits in the free RAM with 8 GiB to spare; otherwise the model stays awake (`[server]
+warning: the model stays awake ...`). Linux only: the driver offers no such suspend elsewhere. `--idle-unload` still
+ends the process, which frees the RAM too; with both, give `idle-unload` the longer time.
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
@@ -168,14 +207,27 @@ Basalt refuses settings that would leave the machine without memory, and never s
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
   buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
 - With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU, so a topic change can
-  swap quickly. The startup line `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept
+  swap quickly. The startup line `free places for the adaptive swaps` shows the count (four times `--adapt-swaps` on a server); if RAM is short, fewer are kept
   and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
-- While serving, a request that finds MemAvailable below the margin plus a prompt chunk's file reads, up to 3.5 GiB (the margin alone when no expert is
-  read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
-  client); the server keeps running and takes the next request. Windows does not count the pages read through the
-  mapped expert file as available, so within 1 GiB of the guard the engine gives them back first and reads again.
+- While serving, the RAM guard watches MemAvailable against the margin plus a prompt chunk's file reads, up to 3.5 GiB
+  (the margin alone when no expert is read from the SSD). Below it, the engine's parked conversations leave RAM (except
+  the one the next request continues): with the disk tier on they go to disk (those it holds no copy of yet), otherwise
+  they are dropped. The engine also frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS,
+  and a request that arrives waits up to 30 s for the RAM to come back before it starts; one that adds at most 256
+  tokens to the live conversation (the server's wrap-up after a thinking budget) does not wait. A request cancelled
+  during the wait ends there, before anything moves for it. Below the guard nothing new is parked, and the disk tier
+  neither writes a conversation still in a session nor reads one back (its own floor sits 1 GiB above the guard's). A
+  running request continues; it stops with an error only when the RAM is critical: under 1 GiB free, or below the guard
+  while the kernel's memory pressure (`/proc/pressure/memory`, avg10) shows tasks stalled most of the time (some >= 60%
+  or full >= 40%). Without a pressure reading (Windows, or a kernel without PSI) below the guard is critical. The error
+  (`RAM low (... free < ... guard) ...: request stopped` or `RAM critical (... free < ... hard floor): request stopped`,
+  also returned to the client) names `--resident-budget-gib` only when the engine's own growth took the RAM, otherwise
+  how much other programs took. The server keeps running and takes the next request. While the model sleeps the guard
+  judges no reading (the driver holds the GPU state in RAM until the wake); the wake takes a fresh one. Windows does not
+  count the pages read through the mapped expert file as available, so within 1 GiB of the guard the engine gives them
+  back first and reads again.
 
 ## Vision: `--vision`
 
@@ -235,3 +287,11 @@ During a batch the command answers `ERR PROBE: ...`.
 
 `PROBE set workers=K share=F` (either key) sets the CPU pool's active worker count and the prompt path's CPU share for the
 requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until the engine stops.
+
+`PROBE adapt [every=N] [swaps=N] [decay=F] [profile=FILE]` puts the expert tiers back where they were at `READY`, or
+with `profile=` places that saved profile's ranking into the same slots, copying only the slots whose expert differs.
+It zeroes the routing counts, the round counter and the draft policy, drops the session's cached prompts, and sets the
+adaptive tier's settings for the requests that follow, so the next request runs as the first after a load. It answers
+`PROBE end adapt every= swaps= decay= moved= peer_moved= kept= ms=` (slots copied on each card, slots left as they
+were, wall time). It needs the adaptive tier on and one main card (no layer split, at most one peer card, not
+`--peer-exclusive`); a swap count above the start's `--adapt-swaps` finds fewer free RAM places for its rounds.

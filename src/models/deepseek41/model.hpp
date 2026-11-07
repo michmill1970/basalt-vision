@@ -5,6 +5,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
@@ -31,6 +32,7 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 }
 
 class ExpertTier;
+class DsparkDrafter;
 
 class DsModel final : public model::LoadedModel {
 public:
@@ -72,6 +74,8 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
+    /// The drafter the sessions share, while one holds it.
+    std::weak_ptr<DsparkDrafter>& shared_drafter() const { return shared_drafter_; }
     /// The sessions that will hold a context each.
     int sessions() const { return tiers_.sessions > 0 ? tiers_.sessions : 1; }
     /// What the flags ask of the expert tiers.
@@ -91,6 +95,8 @@ public:
     /// Opens the image projector: the diagnostic standalone file when set, else the pack's vision section.
     /// False with `err` set when neither exists.
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
+    /// The image encoders' cuBLAS handle, opened by the expert tier at load when images are on.
+    VisionBlas& vision_blas() const { return vision_blas_; }
 
 private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
@@ -103,6 +109,8 @@ private:
     int device_ = 0;
     model::LoadRequest tiers_;
     mutable SharedTier shared_tier_;
+    mutable std::weak_ptr<DsparkDrafter> shared_drafter_;
+    mutable VisionBlas vision_blas_;
     int64_t ctx_ = 0;
     static int64_t ctxp_default();
     int embd_fd_ = -1;

@@ -5,8 +5,8 @@ quality: [precision](../precision/deepseek41.md).
 
 ## Pack
 
-One pack, `DeepSeek-V4.1-Flash-1017-UD-IQ1_M`, on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), about 260 GB, built
-from Unsloth's UD-IQ1_M GGUF. Its layout and the DSpark section: [model file](../model-file.md#deepseek-pack).
+Two packs on [Hugging Face](https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt), built from Unsloth's GGUFs:
+`DeepSeek-V4.1-Flash-1017-UD-IQ1_M` (about 260 GB) and `-UD-IQ2_XXS` (about 285 GB, closer to BF16, slower when experts spill to disk). Its layout and the DSpark section: [model file](../model-file.md#deepseek-pack).
 
 ## Memory
 
@@ -74,8 +74,9 @@ Measured on the UD-IQ1_M pack, 400 W + 180 W, 121 GiB of RAM, `--pool-workers 8`
 
 ## Parallel slots
 
-No throughput gain: at 400 W + 180 W, one stream 60.1 tok/s, two slots 58.4 and four 54.9 in total. Slots share one decode stream
-and draft nothing.
+Slots share one decode stream: a batch window runs each busy slot's window in turn. Each slot drafts as a single stream does, from
+the drafter's window rows of its own conversation. The slots share one drafter, so `--parallel` adds no drafter memory. A request
+alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pinned).
 
 ## Lossy flags
 

@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include "basalt/log.hpp"
 
 namespace basalt::prefill::mmq {
@@ -116,7 +117,51 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
+// Word `w` (16 bytes) of row `r` of a gathered q8_1 buffer: the activation blocks lie block-column by block-column, each
+// column holding one block of every row, so row r of `dst` takes the blocks of row ids[r] of `src`.
+__device__ __forceinline__ void gather_q8_stage(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ ids,
+                                                uint4* __restrict__ dst, int64_t rows, int64_t r, int64_t w) {
+    constexpr int64_t kWords = sizeof(block_q8_1_mmq) / sizeof(uint4);
+    const int64_t kb = w / kWords, j = w - kb * kWords;
+    dst[(kb * rows + r) * kWords + j] = src[(kb * src_rows + ids[r]) * kWords + j];
+}
+
+__global__ void gather_q8_kernel(const uint4* __restrict__ src, int64_t src_rows, const int32_t* __restrict__ ids,
+                                 uint4* __restrict__ dst, int64_t rows, int64_t words) {
+    const int64_t w = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (w < words) gather_q8_stage(src, src_rows, ids, dst, rows, blockIdx.x, w);
+}
+
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
+
+// f(std::integral_constant<ggml_type, t>) for a type `supported` names.
+template <class F>
+void with_type(ggml_type t, F&& f) {
+    switch (t) {
+        case GGML_TYPE_Q2_0: f(std::integral_constant<ggml_type, GGML_TYPE_Q2_0>{}); break;
+        case GGML_TYPE_IQ1_S: f(std::integral_constant<ggml_type, GGML_TYPE_IQ1_S>{}); break;
+        case GGML_TYPE_IQ1_M: f(std::integral_constant<ggml_type, GGML_TYPE_IQ1_M>{}); break;
+        case GGML_TYPE_IQ2_XXS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ2_XXS>{}); break;
+        case GGML_TYPE_IQ2_XS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ2_XS>{}); break;
+        case GGML_TYPE_IQ2_S: f(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{}); break;
+        case GGML_TYPE_IQ3_XXS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{}); break;
+        case GGML_TYPE_IQ3_S: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_S>{}); break;
+        case GGML_TYPE_IQ4_NL: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{}); break;
+        case GGML_TYPE_IQ4_XS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{}); break;
+        case GGML_TYPE_Q8_0: f(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}); break;
+        case GGML_TYPE_Q5_1: f(std::integral_constant<ggml_type, GGML_TYPE_Q5_1>{}); break;
+        case GGML_TYPE_Q5_0: f(std::integral_constant<ggml_type, GGML_TYPE_Q5_0>{}); break;
+        case GGML_TYPE_Q2_K: f(std::integral_constant<ggml_type, GGML_TYPE_Q2_K>{}); break;
+        case GGML_TYPE_Q3_K: f(std::integral_constant<ggml_type, GGML_TYPE_Q3_K>{}); break;
+        case GGML_TYPE_Q4_K: f(std::integral_constant<ggml_type, GGML_TYPE_Q4_K>{}); break;
+        case GGML_TYPE_Q5_K: f(std::integral_constant<ggml_type, GGML_TYPE_Q5_K>{}); break;
+        case GGML_TYPE_Q6_K: f(std::integral_constant<ggml_type, GGML_TYPE_Q6_K>{}); break;
+        case GGML_TYPE_NVFP4: f(std::integral_constant<ggml_type, GGML_TYPE_NVFP4>{}); break;
+        default:
+            basalt::log::error("basalt", "prefill mmq: type %d is not covered", (int) t);
+            std::exit(1);
+    }
+}
 
 }  // namespace
 
@@ -174,6 +219,8 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+int64_t q8_blocks(int64_t cols) { return pad512(cols) / (4 * QK8_1); }
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
@@ -201,31 +248,12 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, opt};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
-    switch (t) {
-        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
-        case GGML_TYPE_IQ1_S: mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ1_M: mul_mat_q_case<GGML_TYPE_IQ1_M>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
-        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
-        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
-        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
-        case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;
-        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;
-        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
-        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
-        case GGML_TYPE_NVFP4: mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s); break;
-        default:
-            basalt::log::error("basalt", "prefill mmq: type %d is not covered", (int) t);
-            std::exit(1);
-    }
+    with_type(t, [&](auto c) { mul_mat_q_case<decltype(c)::value>(ctx, a, s); });
     ck(cudaGetLastError(), "mul_mat_q");
+}
+
+void load(int t, int64_t w_rows) {
+    with_type((ggml_type) t, [&](auto c) { mul_mat_q_load<decltype(c)::value>(w_rows); });
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
@@ -284,6 +312,15 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
                                                                            (const float4*) tail, bounds, n);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream) {
+    if (rows <= 0) return;
+    static_assert(sizeof(block_q8_1_mmq) % sizeof(uint4) == 0, "q8_1 blocks are whole 16-byte words");
+    const int64_t words = pad512(cols) / (4 * QK8_1) * (int64_t) (sizeof(block_q8_1_mmq) / sizeof(uint4));
+    gather_q8_kernel<<<dim3((unsigned) rows, (unsigned) ((words + 127) / 128)), 128, 0, (cudaStream_t) stream>>>(
+        (const uint4*) xq, src_rows, ids, (uint4*) dst, rows, words);
+    ck(cudaGetLastError(), "gather_q8");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

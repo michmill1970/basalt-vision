@@ -22,11 +22,17 @@ bool fits(int ggml_type, int64_t w_rows);
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// The quantized blocks of one row of `cols` values; a buffer of R rows holds block k of row r at block k R + r.
+int64_t q8_blocks(int64_t cols);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
+
+/// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
+/// bytes `quantize` writes when given those ids.
+void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -47,6 +53,11 @@ struct Product {
     /// The rows MMQ sizes its tile against (it takes its smallest tile of at least this many); 0: max_rows.
     int64_t opt_rows = 0;
 };
+
+/// Readies on the current device every tile `Context::run` may launch for weights of `ggml_type` with `w_rows` rows (its
+/// kernels loaded, their shared memory limit raised): done at a tile's first launch, that waits for the copies queued on
+/// the card.
+void load(int ggml_type, int64_t w_rows);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {

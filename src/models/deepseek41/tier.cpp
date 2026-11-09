@@ -78,9 +78,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         one_each += (e.blob_bytes + 255) / 256 * 256;
         one_each_ram += e.blob_bytes;
     }
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     one_each_ = one_each;
@@ -117,6 +118,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     core::detail::HostMemory hm;
     auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
+    uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
     if (m_.tiers().vision && !m_.vision_blas().open(err))
         return false;
@@ -125,7 +127,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     uint64_t avail = available();
     // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
     auto places_in = [&](uint64_t bytes) {
-        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        const uint64_t places = core::ram_tier_room(bytes, tier_reserve, true) / one_each_ram;
         return places > 0 ? places - 1 : 0;
     };
     const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
@@ -145,11 +147,18 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
         avail = available();
+        // and they read through the OS file cache, which keeps its floor beside the reserve (the ring holds a prompt's
+        // reads, so only the layers count)
+        core::FileCache cache;
+        for (const auto& e : m_.pack().experts) cache.layer_bytes = std::max<uint64_t>(cache.layer_bytes, (uint64_t) n_expert_ * e.blob_bytes);
+        if (!ram_given)
+            tier_reserve = ram_reserve + core::file_cache_keep(avail, ram_reserve, true,
+                                                               (uint64_t) (homes_.ram + homes_.file + 1) * one_each_ram, cache);
         ram_slots = ram_in();
         homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
     const uint64_t ram_floor =
-        ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
+        tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {
         share_.reset();
         peer_.reset();
@@ -439,6 +448,16 @@ bool ExpertTier::load_ram(std::string& err) {
         if (unpinned > 0)
             basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
                               ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
+        // Pinned past what the driver backs, the runtime stops answering on every card, and returning the pages does not
+        // bring it back: the start ends here rather than at the first request.
+        std::vector<int> cards{-1};   // the main card is the current one
+        if (peer_) cards.push_back(peer_->device());
+        std::string dead;
+        if (!core::devices_allocate(cards, dead)) {
+            err = "deepseek41: the device cannot allocate after pinning the RAM tier (" + dead +
+                  "); pin less with a smaller --resident-budget-gib";
+            return false;
+        }
     }
     if (ram_load) ram_load->finish();
     if (main_load) main_load->finish();
@@ -935,9 +954,10 @@ void ExpertTier::lend_all() {
 
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
@@ -955,8 +975,13 @@ bool ExpertTier::reclaim(std::string& err) {
 
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        if (!unread_said_) basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: cannot read the free device memory: %s", why.c_str());
+        unread_said_ = true;
+        return;
+    }
     const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;

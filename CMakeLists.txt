@@ -185,7 +185,7 @@ target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_q
 
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
-  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
+  src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/file_reads.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
   src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
@@ -253,6 +253,13 @@ if(BUILD_TESTING)
   target_include_directories(tier_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   basalt_embed_manifest(tier_policy_test)
   basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
+  # the RAM tier's file reads land every blob byte for byte (no GPU)
+  add_executable(file_reads_test src/models/deepseek41/file_reads_test.cpp src/models/deepseek41/file_reads.cpp)
+  target_include_directories(file_reads_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(file_reads_test PRIVATE BASALT_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(file_reads_test PRIVATE platform Threads::Threads)
+  basalt_embed_manifest(file_reads_test)
+  basalt_cpu_test(NAME file_reads_test COMMAND file_reads_test)
   # the DeepSeek context: the refusals, the warning and the cache sizes (no GPU)
   add_executable(context_policy_test src/models/deepseek41/context_policy_test.cpp)
   target_include_directories(context_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -298,7 +305,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
                              src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -370,7 +377,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 # ---- tiers: the storage and transfer tier shared by the models (VRAM slots, RAM and file source, peer card) ----
-add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/vmm.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
+add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp src/core/peer_experts.cpp src/core/conversation_store.cpp src/core/conversation_memory.cpp)
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
@@ -380,6 +387,12 @@ if(BUILD_TESTING)
   basalt_embed_manifest(file_expert_source_test)
   basalt_cpu_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+
+  add_executable(host_registration_test tests/core/host_registration_test.cpp)
+  target_link_libraries(host_registration_test PRIVATE tiers)
+  basalt_embed_manifest(host_registration_test)
+  basalt_gpu_test(NAME host_registration_test COMMAND host_registration_test)
+  set_tests_properties(host_registration_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 # file ranges to the GPU through unbuffered reads
 if(BUILD_TESTING)

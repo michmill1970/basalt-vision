@@ -8,6 +8,7 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/rope_flags.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -96,6 +97,8 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
 };
 
 struct DecodeRequest {
@@ -291,6 +294,8 @@ public:
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
     virtual int max_expert_cards() const = 0;
+    /// A model with no experts to put on a second card reads long prompts there instead (a prompt line, not an expert tier).
+    virtual bool second_card_reads_prompts() const { return false; }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {

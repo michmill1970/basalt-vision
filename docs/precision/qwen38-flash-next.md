@@ -70,6 +70,22 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 | CPU share 0 (all GPU) against 1 (all CPU), NVFP4 DQ6_K, 20 chunks | PPL 2.3046 / 2.3068, KLD 0.07337 / 0.07085, top-1 93.04% / 93.12%; paired +0.0025 [-0.0005, +0.0055] |
 | K-quant MMQ against the FP16 path | rel RMS 1.08e-2 against 5e-4 (MMQ carries int8 activation rounding); 100-chunk gate within run noise |
 
+## QAD checkpoint
+
+The [QAD pack](../model-file.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
+MXFP8 projections and NVFP4 shared experts to Q6_K. Gate: 100 chunks, 400 W + 180 W, tiers pinned, int8 KV; decode is
+`basalt-bench` on two cards, int8 KV.
+
+| Pack | PPL | KLD mean | same top-1 | decode |
+| --- | --- | --- | --- | --- |
+| NVFP4 | 3.3076 | 0.0628 | 91.55% | 484 tok/s |
+| QAD | 3.1516 | 0.0833 | 90.49% | 470 tok/s |
+| QAD, Q8_0 dense | 3.1552 | 0.0794 | 90.78% | 469 tok/s |
+
+QAD against NVFP4, paired: dKLD +0.0205 [+0.0175, +0.0236], dNLL -0.048 [-0.055, -0.041]. The Q6_K re-quantization is
++0.0039 [+0.0025, +0.0053] of that KLD; the rest is the checkpoint, which the distillation made sharper on wikitext and
+further from the BF16 model. On one RTX 5090 decode is the same (355 against 357 tok/s).
+
 ## Measured costs
 
 Gate: 100 chunks, 400 W + 180 W, tiers pinned. Paired against the default (Q6_K dense, int8 KV),

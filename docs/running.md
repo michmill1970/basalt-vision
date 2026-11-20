@@ -11,7 +11,7 @@ show the load: `load.percent` and `load.gib`, the GiB placed so far in one figur
 
 `--parallel N` (1 to 8) serves N requests at once in batch slots. Further requests wait in arrival order. `--max-context` is shared:
 each slot holds `max-context / N` tokens (`--parallel 4 --max-context 262144` gives four slots of 65,536). A request longer than its slot
-is refused with a 400 that names the length. `--slot-full-context` gives every slot the whole `--max-context`, at N times the KV cache.
+is refused with a 400 that names the length; the start log's `slots` line shows the context each slot gets. `--slot-full-context` gives every slot the whole `--max-context`, at N times the KV cache.
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
@@ -22,10 +22,10 @@ slot's own tokens even when the model wrote it in other pieces than the tokenize
 
 With `--parallel`, a request that names its session goes to the slot that session last used, so the next turn continues the K/V already
 there. The session is the first of these headers that is set, then the request body's `session_id`: `x-llm-flow-id`,
-`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`. A request with none picks a slot by the longest shared prefix, then
-the least recently used. When the session's slot is busy, the request takes that normal pick and the session's slot becomes the new
-one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel subagents, so their overlapping requests spread
-over slots.
+`x-claude-code-session-id`, `x-session-id`, `x-session-affinity`, `x-grok-conv-id`, `x-grok-session-id`. A request with none picks a
+slot by the longest shared prefix, then the least recently used. When the session's slot is busy, the request takes that normal pick
+and the session's slot becomes the new one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel
+subagents, so their overlapping requests spread over slots.
 
 ### Prompts beside decoding slots
 
@@ -85,6 +85,15 @@ After the given seconds without requests, the engine frees its VRAM (the driver 
 RAM copy of the experts stay (a dense model has no cache to give back first: the driver moves all its GPU state, both cards' on two cards). The next request wakes it in seconds. Linux only. The server stays awake when the GPU state would not fit in
 free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
+## Lending VRAM: `POST /v1/vram`
+
+With `--vram-elastic`, `POST /v1/vram` with `{"reserve_mib": N}` resizes the expert cache to keep N MiB free (`null`: the start's reserve).
+A resize needs a gap between requests. Idle, it applies at once and answers `200` with the new figures. While a request runs it is
+queued and answered `202 {"status": "pending"}`: it applies when the running requests have finished, and requests that arrive meanwhile
+wait for it, so steady traffic cannot hold it off. A later POST replaces a queued one (`"replaced": true`). A malformed body is a
+`400`. `GET /v1/status` shows `vram.pending` (the queued reserve, or `null`), `vram.applied` and `vram.error` (the engine refused
+the queued one).
+
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
@@ -119,7 +128,9 @@ last bits of the logits, so a greedy answer can fork after some tokens (`dynamic
 | `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB pinned RAM) | 0.77 s / 1.45 s / 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s / 40 s / 70 s |
 
-`dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after. Which
+`dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after.
+Hy4-flash reads images with `dynamic` only: its main-card expert slots go back for the request's pictures and fill again as after a
+prompt. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
 
 ## Video

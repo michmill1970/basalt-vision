@@ -481,6 +481,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
+                        src/kernels/cuda/q80_screen.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/wait_abort.cu
@@ -519,6 +520,7 @@ endif()
 endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    src/kernels/cuda/q80_screen.cu
     src/models/qwen4exp/kernels/native_gr_norm.cu
     src/models/qwen4exp/kernels/native_moe.cu
     src/models/qwen4exp/kernels/native_gdn.cu
@@ -798,6 +800,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
+add_dependencies(serve_shared git_stamp)   # the engine's INFO commit=
+target_include_directories(serve_shared PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
@@ -1003,6 +1007,12 @@ add_executable(mmvq_multi_parity tests/kernels/mmvq_multi_parity.cpp)
 target_include_directories(mmvq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mmvq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+# the draft head screen (q80_screen) against native_mmvq's one-column logits and their argmax, and against a CPU reference
+# (synthetic at the real width, GPU, no model; --bench adds the microbench)
+add_executable(q80_screen_parity tests/kernels/q80_screen_parity.cpp)
+target_include_directories(q80_screen_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_screen_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_screen_parity COMMAND q80_screen_parity)
 if(BASALT_MODEL_QWEN4EXP)
 # the decode GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
 add_executable(dec_gdn_parity tests/models/qwen4exp/kernels/dec_gdn_parity.cpp)
@@ -1456,6 +1466,13 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# the console's per-slot counts and the expert map's sample (CPU only)
+add_executable(console_stats_test tests/program/console_stats_test.cpp)
+target_include_directories(console_stats_test PRIVATE src/program/serve include)
+target_link_libraries(console_stats_test PRIVATE warnings)
+basalt_embed_manifest(console_stats_test)
+basalt_cpu_test(NAME console_stats_test COMMAND console_stats_test)
+set_tests_properties(console_stats_test PROPERTIES TIMEOUT 60)
 # a sent pick's log probability and the row's likeliest tokens (CPU only)
 add_executable(logprobs_test tests/program/logprobs_test.cpp)
 target_include_directories(logprobs_test PRIVATE src/program/serve include)
